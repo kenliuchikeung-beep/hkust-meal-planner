@@ -6,7 +6,6 @@ import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 1. Built-in .xlsx reader (Zero openpyxl needed)
 def read_xlsx_builtin(path):
     ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     with zipfile.ZipFile(path) as z:
@@ -36,7 +35,6 @@ def read_xlsx_builtin(path):
     return pd.DataFrame(data, columns=headers)
 
 
-# 2. Pure NumPy K-Means (Zero scikit-learn needed)
 def run_numpy_kmeans(X, k=4, seed=42, max_iter=50):
     centers = np.array([
         [0.45, 0.20, 0.15, 0.20],
@@ -57,8 +55,6 @@ def run_numpy_kmeans(X, k=4, seed=42, max_iter=50):
                 centers[j] /= centers[j].sum()
     return labels, centers
 
-
-# 3. Built-in SVG Charts (Zero altair / jsonschema needed)
 PALETTE = ["#2563eb", "#f97316", "#10b981", "#8b5cf6", "#ef4444"]
 
 def render_svg_bar_chart(df, height=270):
@@ -144,8 +140,6 @@ def render_svg_line_chart(df, height=270):
     svg.append("</svg>")
     st.markdown("".join(svg), unsafe_allow_html=True)
 
-
-# 4. Main-Meal Filter (Removes Add-ons, Standalone Soups, Corn, and Snacks/Sides)
 NON_MEAL_EXACT_OR_SUBSTR = [
     "add-on:",
     "toast upgrade:",
@@ -191,8 +185,7 @@ def load_and_integrate_data():
     b_file = [f for f in files if f.lower().endswith(".xlsx") and "breakfast" in f.lower()][0]
     l_file = [f for f in files if f.lower().endswith(".xlsx") and "lunch" in f.lower()][0]
     d_file = [f for f in files if f.lower().endswith(".xlsx") and "dinner" in f.lower()][0]
-
-    # A. Clean Qualtrics Survey CSV
+    
     raw_s = pd.read_csv(os.path.join(BASE_DIR, survey_file))
     df_s = raw_s.iloc[2:].copy()
     df_s = df_s[df_s["Status"] != "Survey Preview"].copy()
@@ -224,7 +217,7 @@ def load_and_integrate_data():
     clean_s["Preference_Group"] = clean_s["Cluster_ID"].map(cluster_names)
     profiles = {cluster_names[i]: np.round(centers[i], 3).tolist() for i in range(4)}
 
-    # B. Clean & Merge Real Breakfast, Lunch & Dinner Excel Files (Main Meals Only)
+ 
     dfs = []
     for fname, slot in [(b_file, "Breakfast"), (l_file, "Lunch"), (d_file, "Dinner")]:
         d = read_xlsx_builtin(os.path.join(BASE_DIR, fname))
@@ -243,7 +236,7 @@ def load_and_integrate_data():
     menu = menu[menu["Price_HKD"] >= 12.0]
     menu = menu[menu.apply(is_main_meal_dish, axis=1)].reset_index(drop=True)
 
-    # Normalize Outlet Names (Golden Rice & Super Sandwich)
+   
     def normalize_outlet(o):
         ol = str(o).strip().lower()
         if "gold rice bowl" in ol or "golden bowl" in ol or "金飯碗" in ol:
@@ -253,7 +246,7 @@ def load_and_integrate_data():
         return str(o).strip()
     menu["Outlet"] = menu["Outlet"].apply(normalize_outlet)
 
-    # Guarantee Veggie Category contains 100% no meat, seafood, or egg
+  
     non_veg_pattern = re.compile(
         r"\b(?:pork|beef|chicken|duck|ham|bacon|sausage|fish|salmon|tuna|shrimp|prawn|crab|squid|eel|egg|lamb|meat|cuttlefish|pomfret|bream|salami|bolognese|char siu|spare rib|unagi)s?\b"
     )
@@ -266,7 +259,6 @@ def load_and_integrate_data():
         return cat
     menu["Category"] = menu.apply(verify_veggie_category, axis=1)
 
-    # Dish Feature Scoring (0.0 to 1.0 normalized scores)
     p_min, p_max = menu["Price_HKD"].min(), menu["Price_HKD"].max()
     menu["Price_Score"] = ((p_max - menu["Price_HKD"]) / (p_max - p_min)).round(3)
     menu["Taste_Score"] = menu["Flavor Profile"].fillna("").str.lower().apply(
@@ -291,7 +283,7 @@ def load_and_integrate_data():
     return clean_s, profiles, menu
 
 
-# --- MODULE 2: Natural-Language Craving, Restaurant & Constraint Parser ---
+
 FOOD_SYNONYMS = {
     "egg": ["egg", "eggs", "omelette", "omelet", "scrambled"],
     "beef": ["beef", "steak", "brisket", "sirloin", "ribeye", "oxtail"],
@@ -411,7 +403,7 @@ def _detect_restaurants_in_text(txt, available_outlets):
 def parse_craving_prompt_offline(prompt_text, base_weights, default_budget, ui_restaurants=None, available_outlets=None):
     txt = prompt_text.lower()
 
-    # 1. Extract Budget
+   
     m_explicit = re.search(r"(?:hk\$|\$|hkd\s*|budget\s*(?:of|is|:|=)?\s*\$?|under\s*(?:hk\$|\$)?\s*|around\s*(?:hk\$|\$)?\s*)(\d{2,3})\b", txt)
     if m_explicit:
         budget = int(m_explicit.group(1))
@@ -419,7 +411,7 @@ def parse_craving_prompt_offline(prompt_text, base_weights, default_budget, ui_r
         m_num = re.search(r"\b(\d{2,3})\s*(?:hkd|dollars?|bucks?)\b", txt)
         budget = int(m_num.group(1)) if m_num else default_budget
 
-    # 2. Split prompt into clauses & detect exclusions vs. cravings
+  
     clauses = re.split(r"[,;.\n]+|\b(?:but|except|however|though|also)\b", txt)
 
     exclude_kw = []
@@ -477,11 +469,11 @@ def parse_craving_prompt_offline(prompt_text, base_weights, default_budget, ui_r
 
     craving_kw = [k for k in craving_kw if k not in exclude_kw]
 
-    # 3. Restaurant Preference (UI selection + any outlet mentioned in prompt)
+  
     prompt_restaurants = _detect_restaurants_in_text(txt, available_outlets or [])
     preferred_restaurants = list(dict.fromkeys((ui_restaurants or []) + prompt_restaurants))
 
-    # 4. Dynamic Weight Shift
+  
     w = list(base_weights)
     if any(k in txt for k in ["fast", "quick", "short queue", "convenient", "grab and go"]):
         w[3] += 0.14
@@ -733,9 +725,9 @@ with st.sidebar.expander("🔌 Optional: Live LLM API Settings", expanded=False)
     llm_model = st.text_input("Model Name", value="gpt-4o-mini")
 
 tab1, tab2, tab3 = st.tabs([
-    "📊 1. Student Preference Profiler & Menu Database",
-    "🤖 2. Smart Constraint Parser & Daily Meal Planner",
-    "📈 3. Benchmark Evaluation & Budget Sensitivity"
+    " 1. Student Preference Profiler & Menu Database",
+    " 2. Smart Constraint Parser & Daily Meal Planner",
+    " 3. Benchmark Evaluation & Budget Sensitivity"
 ])
 
 with tab1:
@@ -747,7 +739,7 @@ with tab1:
         st.dataframe(p_df, use_container_width=True)
         render_svg_bar_chart(p_df)
     with c2:
-        st.subheader("🧭 Your Matched Preference Profile")
+        st.subheader(" Your Matched Preference Profile")
         st.caption("Synchronized with your 4 rating sliders in the left sidebar.")
         st.info(f"**Closest Preference Group:** **{selected_profile}**")
         match_df = pd.DataFrame(
@@ -756,7 +748,7 @@ with tab1:
         )
         st.dataframe(match_df, use_container_width=True)
 
-    st.subheader(f"🍜 HKUST Campus Main-Meal Database ({len(menu)} Full Meals Across Breakfast, Lunch & Dinner)")
+    st.subheader(f" HKUST Campus Main-Meal Database ({len(menu)} Full Meals Across Breakfast, Lunch & Dinner)")
     slot_filter = st.selectbox("Filter Menu by Meal Slot", ["All", "Breakfast", "Lunch", "Dinner"])
     view_df = menu if slot_filter == "All" else menu[menu["Meal_Slot"] == slot_filter]
     st.dataframe(
@@ -794,7 +786,7 @@ with tab2:
 
     p_col1, p_col2 = st.columns([1.2, 1])
     with p_col1:
-        st.markdown("##### 🔍 Extracted Dining Constraints")
+        st.markdown("#####  Extracted Dining Constraints")
         st.caption(f"**Parser Mode:** `{parsed['parser_mode']}`")
         m1, m2, m3 = st.columns(3)
         m1.metric("Target Budget", f"HK${parsed['budget_hkd']}")
@@ -807,7 +799,7 @@ with tab2:
         with st.expander("View Structured JSON Output", expanded=False):
             st.json(parsed)
     with p_col2:
-        st.markdown("##### ⚖️ Priority Weight Adjustment (`w_base` → `w_final`)")
+        st.markdown("#####  Priority Weight Adjustment (`w_base` → `w_final`)")
         w_comp_df = pd.DataFrame(
             {"Base Group Weight": parsed["w_base"], "Adjusted Weight": parsed["w_final"]},
             index=["Price", "Taste", "Health", "Convenience"]
@@ -822,7 +814,7 @@ with tab2:
     )
 
     m_cols = st.columns(3)
-    for col, slot_name, dish in zip(m_cols, ["🌅 Breakfast", "☀️ Lunch", "🌙 Dinner"], best_combo):
+    for col, slot_name, dish in zip(m_cols, [" Breakfast", " Lunch", " Dinner"], best_combo):
         with col:
             st.markdown(
                 f"""
