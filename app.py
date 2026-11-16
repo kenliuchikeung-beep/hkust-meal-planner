@@ -145,6 +145,45 @@ def render_svg_line_chart(df, height=270):
     st.markdown("".join(svg), unsafe_allow_html=True)
 
 
+# 4. Main-Meal Filter (Removes Add-ons, Standalone Soups, Corn, and Snacks/Sides)
+NON_MEAL_EXACT_OR_SUBSTR = [
+    "add-on:",
+    "toast upgrade:",
+    "savory roasted corn",
+    "fresh fruit cup",
+    "banana blueberry oat yogurt cup",
+    "whole wheat toast (2 pcs)",
+    "cheese bolognese fries",
+    "veggie spring rolls",
+    "savory glazed chicken wings",
+    "vegetable soup",
+    "cream of mushroom soup",
+    "pan-fried turnip cake",
+    "fish meat siu mai",
+    "chiu chow dumpling (teochew fun gor)",
+    "mini glutinous rice chicken wrap",
+]
+
+MEAL_STAPLE_TERMS = [
+    "rice", "noodle", "udon", "ramen", "spaghetti", "pasta", "penne",
+    "macaroni", "vermicelli", "salad", "burger", "sandwich", "baguette",
+    "congee", "hotpot", "grill", "set", "meal", "combo", "hot dog",
+    "mcmuffin", "breakfast", "hotcakes", "oatmeal"
+]
+
+def is_main_meal_dish(row):
+    name = str(row["Dish Name"]).strip().lower()
+    cat = str(row["Category"]).strip().lower()
+    if "add-on" in cat:
+        return False
+    if any(term in name for term in NON_MEAL_EXACT_OR_SUBSTR):
+        if not any(combo_kw in name for combo_kw in ["congee +", "platter", "b9 light choice"]):
+            return False
+    if name.endswith("soup") and not any(st_kw in name for st_kw in MEAL_STAPLE_TERMS):
+        return False
+    return True
+
+
 @st.cache_data
 def load_and_integrate_data():
     files = os.listdir(BASE_DIR)
@@ -185,7 +224,7 @@ def load_and_integrate_data():
     clean_s["Preference_Group"] = clean_s["Cluster_ID"].map(cluster_names)
     profiles = {cluster_names[i]: np.round(centers[i], 3).tolist() for i in range(4)}
 
-    # B. Clean & Merge Real Breakfast, Lunch & Dinner Excel Files
+    # B. Clean & Merge Real Breakfast, Lunch & Dinner Excel Files (Main Meals Only)
     dfs = []
     for fname, slot in [(b_file, "Breakfast"), (l_file, "Lunch"), (d_file, "Dinner")]:
         d = read_xlsx_builtin(os.path.join(BASE_DIR, fname))
@@ -201,25 +240,48 @@ def load_and_integrate_data():
     menu["Price_HKD"] = pd.to_numeric(menu["Price_HKD"], errors="coerce")
     menu = menu.dropna(subset=["Dish Name", "Price_HKD"]).copy()
     menu = menu[menu["Dish Name"].astype(str).str.strip() != ""]
-    menu = menu[~menu["Dish Name"].astype(str).str.startswith(("Add-on:", "Toast Upgrade:"))]
-    menu = menu[menu["Price_HKD"] >= 12.0].reset_index(drop=True)
+    menu = menu[menu["Price_HKD"] >= 12.0]
+    menu = menu[menu.apply(is_main_meal_dish, axis=1)].reset_index(drop=True)
+
+    # Normalize Outlet Names (Golden Rice & Super Sandwich)
+    def normalize_outlet(o):
+        ol = str(o).strip().lower()
+        if "gold rice bowl" in ol or "golden bowl" in ol or "金飯碗" in ol:
+            return "Golden Rice"
+        if "super sandwich" in ol:
+            return "Super Sandwich"
+        return str(o).strip()
+    menu["Outlet"] = menu["Outlet"].apply(normalize_outlet)
+
+    # Guarantee Veggie Category contains 100% no meat, seafood, or egg
+    non_veg_pattern = re.compile(
+        r"\b(?:pork|beef|chicken|duck|ham|bacon|sausage|fish|salmon|tuna|shrimp|prawn|crab|squid|eel|egg|lamb|meat|cuttlefish|pomfret|bream|salami|bolognese|char siu|spare rib|unagi)s?\b"
+    )
+    def verify_veggie_category(row):
+        cat = str(row["Category"]).strip()
+        text = (str(row["Dish Name"]) + " " + str(row["Flavor Profile"])).lower()
+        if "veggie" in cat.lower() and "high protein" not in cat.lower():
+            if non_veg_pattern.search(text):
+                return "High Protein (meat/egg)"
+        return cat
+    menu["Category"] = menu.apply(verify_veggie_category, axis=1)
 
     # Dish Feature Scoring (0.0 to 1.0 normalized scores)
     p_min, p_max = menu["Price_HKD"].min(), menu["Price_HKD"].max()
     menu["Price_Score"] = ((p_max - menu["Price_HKD"]) / (p_max - p_min)).round(3)
     menu["Taste_Score"] = menu["Flavor Profile"].fillna("").str.lower().apply(
         lambda s: 0.92 if any(k in s for k in ["spicy", "mala", "truffle", "curry", "umami", "rich", "satay", "garlic", "roasted", "bbq"])
-        else (0.80 if any(k in s for k in ["savory", "sweet", "tangy", "herbal", "creamy"]) else 0.68)
+        else (0.80 if any(k in s for k in ["savory", "savoury", "sweet", "tangy", "herbal", "creamy"]) else 0.68)
     )
     menu["Health_Score"] = menu.apply(
         lambda r: 0.25 if ("yes" in str(r["Fried"]).lower() or "deep-fried" in str(r["Fried"]).lower())
         else (0.52 if "pan-fried" in str(r["Fried"]).lower()
-              else (0.92 if any(k in str(r["Category"]).lower() for k in ["veggie", "salad", "healthy", "steamed"]) else 0.78)),
+              else (0.92 if (str(r["Category"]).lower().startswith("veggie") or any(k in str(r["Category"]).lower() for k in ["salad", "healthy", "steamed"])) else 0.78)),
         axis=1
     )
     menu["Conv_Score"] = menu["Outlet"].fillna("").str.lower().apply(
         lambda o: 0.95 if ("mcdonald" in o or "super sandwich" in o or "starbucks" in o)
-        else (0.82 if ("lg1" in o or "pacific" in o or "gold rice bowl" in o or "passione" in o) else 0.62)
+        else (0.82 if ("lg1" in o or "pacific" in o or "golden rice" in o or "gold rice bowl" in o or "golden bowl" in o or "passione" in o) else 0.62)
     )
     menu["Search_Text"] = (
         menu["Dish Name"].fillna("") + " " + menu["Flavor Profile"].fillna("") + " " +
@@ -229,15 +291,15 @@ def load_and_integrate_data():
     return clean_s, profiles, menu
 
 
-# --- MODULE 2: Natural-Language Craving & Constraint Parser ---
+# --- MODULE 2: Natural-Language Craving, Restaurant & Constraint Parser ---
 FOOD_SYNONYMS = {
     "egg": ["egg", "eggs", "omelette", "omelet", "scrambled"],
     "beef": ["beef", "steak", "brisket", "sirloin", "ribeye", "oxtail"],
     "pork": ["pork", "ham", "bacon", "sausage", "char siu", "luncheon", "ribs", "minced pork"],
     "chicken": ["chicken", "wings", "drumstick", "poultry"],
     "duck": ["duck", "roast duck"],
-    "fish": ["fish", "salmon", "tuna", "cod", "halibut", "eel", "fillet"],
-    "seafood": ["seafood", "shrimp", "prawn", "prawns", "crab", "lobster", "clam", "mussel", "oyster", "squid", "shellfish"],
+    "fish": ["fish", "salmon", "tuna", "cod", "halibut", "eel", "fillet", "pomfret", "bream"],
+    "seafood": ["seafood", "shrimp", "prawn", "prawns", "crab", "lobster", "clam", "mussel", "oyster", "squid", "cuttlefish", "shellfish"],
     "shrimp": ["shrimp", "prawn", "prawns"],
     "dairy": ["dairy", "milk", "cheese", "butter", "cream", "creamy", "yogurt", "latte", "cappuccino"],
     "milk": ["milk", "dairy", "latte"],
@@ -271,6 +333,16 @@ FOOD_SYNONYMS = {
     "coffee": ["coffee", "americano", "espresso", "latte", "cappuccino", "mocha"],
 }
 
+RESTAURANT_ALIASES = {
+    "mcdonald": ["mcdonald's", "mcdonalds", "mcdonald", "mcd"],
+    "super sandwich": ["super sandwich", "super sandwiches", "oss"],
+    "tamjai samgor": ["tamjai", "tam jai", "samgor", "sam gor"],
+    "lg1 canteen": ["lg1", "lg1 canteen"],
+    "pacific catering": ["pacific", "pacific catering"],
+    "golden rice": ["golden rice", "gold rice bowl", "golden bowl", "金飯碗"],
+    "american diner": ["american diner", "diner"],
+}
+
 NEGATION_TRIGGERS = [
     r"\ballerg(?:y|ic|ies)\b",
     r"\bintoleran(?:t|ce)\b",
@@ -301,14 +373,12 @@ NEGATION_TRIGGERS = [
 NON_FOOD_STOPWORDS = {
     "food", "foods", "meal", "meals", "dish", "dishes", "item", "items", "ingredient", "ingredients",
     "to", "of", "for", "with", "and", "or", "the", "a", "an", "my", "me", "i", "am", "is", "are", "have",
-    "has", "had", "please", "pls", "today", "now", "lunch", "dinner", "breakfast", "time", "available",
-    "budget", "hkd", "hk", "dollar", "dollars", "min", "mins", "minute", "minutes", "hour", "hours",
-    "allergy", "allergic", "allergies", "intolerant", "intolerance", "ban", "banned", "avoid", "no",
-    "not", "without", "exclude", "excluded", "skip", "free", "cannot", "cant", "dont", "eat", "want",
-    "like", "hate", "dislike", "never", "forbid", "forbidden", "restrict", "restricted", "any", "some",
-    "very", "much", "too", "also", "only", "between", "lecture", "lectures", "class", "classes", "at",
-    "in", "on", "from", "until", "till", "around", "under", "over", "fast", "quick", "rush", "short",
-    "queue", "healthy", "clean", "diet", "gym", "cheap", "broke", "tight", "save", "money"
+    "has", "had", "please", "pls", "today", "now", "lunch", "dinner", "breakfast", "budget", "hkd", "hk",
+    "dollar", "dollars", "allergy", "allergic", "allergies", "intolerant", "intolerance", "ban", "banned",
+    "avoid", "no", "not", "without", "exclude", "excluded", "skip", "free", "cannot", "cant", "dont", "eat",
+    "want", "like", "hate", "dislike", "never", "forbid", "forbidden", "restrict", "restricted", "any",
+    "some", "very", "much", "too", "also", "only", "at", "in", "on", "from", "around", "under", "over",
+    "healthy", "clean", "diet", "gym", "cheap", "broke", "tight", "save", "money", "restaurant", "canteen"
 }
 
 
@@ -323,17 +393,30 @@ def _match_food_terms_in_text(segment):
     return found
 
 
-def parse_craving_prompt_offline(prompt_text, base_weights, default_budget):
+def _detect_restaurants_in_text(txt, available_outlets):
+    matched = []
+    for outlet in available_outlets:
+        o_low = outlet.lower()
+        if o_low in txt and outlet not in matched:
+            matched.append(outlet)
+            continue
+        for key, aliases in RESTAURANT_ALIASES.items():
+            if key in o_low and any(a in txt for a in aliases):
+                if outlet not in matched:
+                    matched.append(outlet)
+                break
+    return matched
+
+
+def parse_craving_prompt_offline(prompt_text, base_weights, default_budget, ui_restaurants=None, available_outlets=None):
     txt = prompt_text.lower()
 
-    # 1. Extract Budget (avoid matching 4-digit 24h clock times like 1600-1900)
-    txt_no_time = re.sub(r"\b\d{3,4}\s*[-–to]+\s*\d{3,4}\b", " ", txt)
-    txt_no_time = re.sub(r"\b\d{1,2}:\d{2}\b", " ", txt_no_time)
-    m_explicit = re.search(r"(?:hk\$|\$|hkd\s*|budget\s*(?:of|is|:|=)?\s*\$?|under\s*(?:hk\$|\$)?\s*|around\s*(?:hk\$|\$)?\s*)(\d{2,3})\b", txt_no_time)
+    # 1. Extract Budget
+    m_explicit = re.search(r"(?:hk\$|\$|hkd\s*|budget\s*(?:of|is|:|=)?\s*\$?|under\s*(?:hk\$|\$)?\s*|around\s*(?:hk\$|\$)?\s*)(\d{2,3})\b", txt)
     if m_explicit:
         budget = int(m_explicit.group(1))
     else:
-        m_num = re.search(r"\b(\d{2,3})\s*(?:hkd|dollars?|bucks?)\b", txt_no_time)
+        m_num = re.search(r"\b(\d{2,3})\s*(?:hkd|dollars?|bucks?)\b", txt)
         budget = int(m_num.group(1)) if m_num else default_budget
 
     # 2. Split prompt into clauses & detect exclusions vs. cravings
@@ -394,30 +477,13 @@ def parse_craving_prompt_offline(prompt_text, base_weights, default_budget):
 
     craving_kw = [k for k in craving_kw if k not in exclude_kw]
 
-    # 3. Schedule / Time Window & Fast-Lunch Detection
-    fast_lunch = any(k in txt for k in [
-        "fast", "rush", "quick", "15 min", "10 min", "20 min", "short queue",
-        "between lecture", "in a hurry", "grab and go", "no time", "tight schedule"
-    ])
-    time_window = None
-    m_time = re.search(r"\b(\d{1,2}:?\d{2})\s*[-–to]+\s*(\d{1,2}:?\d{2})\b", txt)
-    if m_time:
-        t_start, t_end = m_time.group(1), m_time.group(2)
-        time_window = f"{t_start}–{t_end}"
-        try:
-            s_clean, e_clean = t_start.replace(":", ""), t_end.replace(":", "")
-            s_mins = int(s_clean[:-2]) * 60 + int(s_clean[-2:])
-            e_mins = int(e_clean[:-2]) * 60 + int(e_clean[-2:])
-            if 0 < (e_mins - s_mins) <= 35:
-                fast_lunch = True
-        except Exception:
-            pass
-
-    lunch_min_conv = 0.80 if fast_lunch else 0.0
+    # 3. Restaurant Preference (UI selection + any outlet mentioned in prompt)
+    prompt_restaurants = _detect_restaurants_in_text(txt, available_outlets or [])
+    preferred_restaurants = list(dict.fromkeys((ui_restaurants or []) + prompt_restaurants))
 
     # 4. Dynamic Weight Shift
     w = list(base_weights)
-    if fast_lunch:
+    if any(k in txt for k in ["fast", "quick", "short queue", "convenient", "grab and go"]):
         w[3] += 0.14
     if any(k in txt for k in ["healthy", "salad", "clean", "protein", "diet", "gym", "light", "low cal"]) or "fried" in exclude_kw:
         w[2] += 0.14
@@ -428,19 +494,18 @@ def parse_craving_prompt_offline(prompt_text, base_weights, default_budget):
     w_final = [round(x / sum(w), 3) for x in w]
 
     return {
-        "parser_mode": "Built-in Offline NLP (Clause-Aware Allergy & Restriction Engine)",
+        "parser_mode": "Built-in Offline NLP (Clause-Aware Allergy, Restaurant & Craving Engine)",
         "budget_hkd": int(np.clip(budget, 35, 250)),
-        "time_window": time_window if time_window else "Flexible",
+        "preferred_restaurants": preferred_restaurants,
         "exclude_keywords": exclude_kw,
-        "lunch_min_conv_score": lunch_min_conv,
         "craving_keywords": craving_kw,
         "w_base": base_weights,
         "w_final": w_final,
     }
 
 
-def parse_craving_prompt_llm(prompt_text, base_weights, default_budget, api_key, api_url, model_name):
-    fallback = parse_craving_prompt_offline(prompt_text, base_weights, default_budget)
+def parse_craving_prompt_llm(prompt_text, base_weights, default_budget, api_key, api_url, model_name, ui_restaurants=None, available_outlets=None):
+    fallback = parse_craving_prompt_offline(prompt_text, base_weights, default_budget, ui_restaurants, available_outlets)
     if not api_key or not api_key.strip():
         return fallback
 
@@ -449,9 +514,7 @@ def parse_craving_prompt_llm(prompt_text, base_weights, default_budget, api_key,
         f"[Price, Taste, Health, Convenience] = {base_weights} (default budget HK${default_budget}), "
         "return ONLY a valid JSON object with keys: "
         "\"budget_hkd\" (int, 35-250), "
-        "\"time_window\" (string, e.g. \"1600-1900\" or \"Flexible\"), "
         "\"exclude_keywords\" (list of lowercase strings for ANY food allergy, intolerance, banned item, or disliked food such as egg, beef, pork, chicken, fish, seafood, shrimp, dairy, milk, cheese, peanut, gluten, soy, mushroom, fried, spicy), "
-        "\"lunch_min_conv_score\" (float: 0.80 if they need a fast/quick meal or have <=30 mins, else 0.0), "
         "\"craving_keywords\" (list of lowercase food/flavor keywords they positively want; NEVER include anything from exclude_keywords), "
         "\"w_final\" (list of 4 floats summing to 1.0 representing adjusted [Price, Taste, Health, Convenience] weights)."
     )
@@ -487,9 +550,8 @@ def parse_craving_prompt_llm(prompt_text, base_weights, default_budget, api_key,
             return {
                 "parser_mode": f"Live LLM API ({model_name}) + Allergy Safety Guard",
                 "budget_hkd": int(parsed_llm.get("budget_hkd", fallback["budget_hkd"])),
-                "time_window": str(parsed_llm.get("time_window", fallback["time_window"])),
+                "preferred_restaurants": fallback["preferred_restaurants"],
                 "exclude_keywords": merged_ex,
-                "lunch_min_conv_score": float(parsed_llm.get("lunch_min_conv_score", fallback["lunch_min_conv_score"])),
                 "craving_keywords": llm_crav,
                 "w_base": base_weights,
                 "w_final": [round(x / w_sum, 3) for x in w_f],
@@ -511,21 +573,16 @@ def filter_pools(menu, parsed):
             pattern = "|".join(rf"\b{re.escape(w)}s?\b" for w in syn_list)
             df = df[~df["Search_Text"].str.contains(pattern, regex=True)]
 
-    def _safe_slot(slot_name, min_conv=0.0):
-        sub = df[(df["Meal_Slot"] == slot_name) & (df["Conv_Score"] >= min_conv)].reset_index(drop=True)
-        if len(sub) == 0:
-            sub = df[df["Meal_Slot"] == slot_name].reset_index(drop=True)
+    def _safe_slot(slot_name):
+        sub = df[df["Meal_Slot"] == slot_name].reset_index(drop=True)
         if len(sub) == 0:
             sub = menu[menu["Meal_Slot"] == slot_name].reset_index(drop=True)
         return sub
 
-    b_pool = _safe_slot("Breakfast", 0.0)
-    l_pool = _safe_slot("Lunch", parsed["lunch_min_conv_score"])
-    d_pool = _safe_slot("Dinner", 0.0)
-    return b_pool, l_pool, d_pool
+    return _safe_slot("Breakfast"), _safe_slot("Lunch"), _safe_slot("Dinner")
 
 
-def combo_fitness(combo, w, budget, craving_kw, use_craving_bonus=True):
+def combo_fitness(combo, w, budget, craving_kw, preferred_restaurants=None, use_craving_bonus=True):
     total_cost = sum(float(r["Price_HKD"]) for r in combo)
     base_u = sum(
         w[0]*r["Price_Score"] + w[1]*r["Taste_Score"] + w[2]*r["Health_Score"] + w[3]*r["Conv_Score"]
@@ -540,21 +597,28 @@ def combo_fitness(combo, w, budget, craving_kw, use_craving_bonus=True):
                 if any(s in r["Search_Text"] for s in syn_list):
                     matches += 1
             bonus += 0.15 * min(matches, 2)
+    # Restaurant preference bonus (+0.45 per meal from a preferred restaurant)
+    rest_bonus = 0.0
+    if preferred_restaurants:
+        pref_set = {p.lower() for p in preferred_restaurants}
+        for r in combo:
+            if str(r["Outlet"]).strip().lower() in pref_set:
+                rest_bonus += 0.45
     over_budget_pen = 2.0 * max(0.0, total_cost - budget)
     outlets = [r["Outlet"] for r in combo]
     names = [r["Dish Name"] for r in combo]
-    repeat_pen = (0.50 if len(set(names)) < 3 else 0.0) + (0.35 if len(set(outlets)) == 1 else 0.0)
-    return base_u + bonus - over_budget_pen - repeat_pen, base_u, total_cost
+    repeat_pen = (0.50 if len(set(names)) < 3 else 0.0) + (0.35 if (len(set(outlets)) == 1 and not preferred_restaurants) else 0.0)
+    return base_u + bonus + rest_bonus - over_budget_pen - repeat_pen, base_u, total_cost
 
 
-def run_genetic_algorithm(b_pool, l_pool, d_pool, w, budget, craving_kw, use_craving_bonus=True, pop_size=50, generations=40, seed=42):
+def run_genetic_algorithm(b_pool, l_pool, d_pool, w, budget, craving_kw, preferred_restaurants=None, use_craving_bonus=True, pop_size=50, generations=40, seed=42):
     rng = random.Random(seed)
     pop = [[b_pool.iloc[rng.randrange(len(b_pool))],
             l_pool.iloc[rng.randrange(len(l_pool))],
             d_pool.iloc[rng.randrange(len(d_pool))]] for _ in range(pop_size)]
     history = []
     for _ in range(generations):
-        scored = [(combo_fitness(c, w, budget, craving_kw, use_craving_bonus)[0], c) for c in pop]
+        scored = [(combo_fitness(c, w, budget, craving_kw, preferred_restaurants, use_craving_bonus)[0], c) for c in pop]
         scored.sort(key=lambda x: x[0], reverse=True)
         history.append(round(scored[0][0], 3))
         new_pop = [scored[0][1], scored[1][1]]
@@ -570,8 +634,8 @@ def run_genetic_algorithm(b_pool, l_pool, d_pool, w, budget, craving_kw, use_cra
                 child[slot] = pool.iloc[rng.randrange(len(pool))]
             new_pop.append(child)
         pop = new_pop
-    best_fit, best_combo = max([(combo_fitness(c, w, budget, craving_kw, use_craving_bonus)[0], c) for c in pop], key=lambda x: x[0])
-    _, base_u, cost = combo_fitness(best_combo, w, budget, craving_kw, use_craving_bonus)
+    best_fit, best_combo = max([(combo_fitness(c, w, budget, craving_kw, preferred_restaurants, use_craving_bonus)[0], c) for c in pop], key=lambda x: x[0])
+    _, base_u, cost = combo_fitness(best_combo, w, budget, craving_kw, preferred_restaurants, use_craving_bonus)
     return best_combo, round(best_fit, 3), round(base_u, 3), round(cost, 1), history
 
 
@@ -639,15 +703,28 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🍽️ EatSmart @ HKUST — Budget-Aware AI Campus Meal Planner")
-st.caption("Personalized full-day meal optimization combining student survey clustering, natural-language constraint extraction, and genetic algorithm search.")
+st.caption("Personalized full-day meal optimization combining student survey clustering, natural-language constraint extraction, and genetic algorithm search (Main Meals Only).")
 
 clean_s, profiles, menu = load_and_integrate_data()
+all_outlets = sorted(menu["Outlet"].dropna().unique().tolist())
 
-st.sidebar.header("⚙️ Dining Profile & Budget")
-selected_profile = st.sidebar.selectbox("1. Select Student Preference Group", list(profiles.keys()))
+# --- SIDEBAR: Interactive Preference Matcher (Drives the 4-Group Classification) ---
+st.sidebar.header("🧭 Interactive Preference Matcher")
+st.sidebar.caption("Rate each dining factor (1–5) to automatically match your closest HKUST preference group:")
+r_p = st.sidebar.slider("Importance of Affordable Price", 1, 5, 4)
+r_t = st.sidebar.slider("Importance of Taste & Flavor", 1, 5, 5)
+r_h = st.sidebar.slider("Importance of Nutrition & Health", 1, 5, 3)
+r_c = st.sidebar.slider("Importance of Fast Service & Short Queue", 1, 5, 3)
+
+u_vec = np.array([r_p, r_t, r_h, r_c], dtype=float)
+u_norm = np.round(u_vec / u_vec.sum(), 3)
+selected_profile = min(profiles.keys(), key=lambda k: np.linalg.norm(u_norm - np.array(profiles[k])))
 w_base = profiles[selected_profile]
-st.sidebar.caption(f"Base Weights `[Price, Taste, Health, Conv]`: `{w_base}`")
-default_budget = st.sidebar.slider("2. Daily Budget Limit (HK$)", 35, 160, 95, 5)
+
+st.sidebar.success(f"**Matched Group:** **{selected_profile}**  \n**Your Weights:** `{u_norm.tolist()}`  \n**Group Centroid:** `{w_base}`")
+
+st.sidebar.divider()
+default_budget = st.sidebar.slider("Daily Budget Limit (HK$)", 35, 160, 95, 5)
 
 with st.sidebar.expander("🔌 Optional: Live LLM API Settings", expanded=False):
     st.caption("The constraint parser works **100% offline** by default. Add an OpenAI-compatible key below only if you want live cloud LLM parsing.")
@@ -662,7 +739,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 with tab1:
-    c1, c2 = st.columns([1.2, 1])
+    c1, c2 = st.columns([1.3, 1])
     with c1:
         st.subheader(f"Student Dining Preference Groups ({len(clean_s)} Survey Responses)")
         st.caption("Normalized priority weights discovered via K-Means clustering on HKUST student dining survey data.")
@@ -670,18 +747,16 @@ with tab1:
         st.dataframe(p_df, use_container_width=True)
         render_svg_bar_chart(p_df)
     with c2:
-        st.subheader("🧭 Interactive Preference Matcher")
-        st.caption("Rate each dining factor from 1 (low) to 5 (high) to find your closest student preference group.")
-        r_p = st.slider("Importance of Affordable Price", 1, 5, 4)
-        r_t = st.slider("Importance of Taste & Flavor", 1, 5, 5)
-        r_h = st.slider("Importance of Nutrition & Health", 1, 5, 3)
-        r_c = st.slider("Importance of Fast Service & Short Queue", 1, 5, 3)
-        u_vec = np.array([r_p, r_t, r_h, r_c], dtype=float)
-        u_norm = np.round(u_vec / u_vec.sum(), 3)
-        nearest = min(profiles.keys(), key=lambda k: np.linalg.norm(u_norm - np.array(profiles[k])))
-        st.success(f"**Normalized Weight Vector:** `{u_norm.tolist()}`  \n**Closest Preference Group:** **{nearest}**")
+        st.subheader("🧭 Your Matched Preference Profile")
+        st.caption("Synchronized with your 4 rating sliders in the left sidebar.")
+        st.info(f"**Closest Preference Group:** **{selected_profile}**")
+        match_df = pd.DataFrame(
+            {"Your Input Weights": u_norm.tolist(), f"{selected_profile} Centroid": w_base},
+            index=["Price", "Taste", "Health", "Convenience"]
+        )
+        st.dataframe(match_df, use_container_width=True)
 
-    st.subheader(f"🍜 HKUST Campus Menu Database ({len(menu)} Dishes Across Breakfast, Lunch & Dinner)")
+    st.subheader(f"🍜 HKUST Campus Main-Meal Database ({len(menu)} Full Meals Across Breakfast, Lunch & Dinner)")
     slot_filter = st.selectbox("Filter Menu by Meal Slot", ["All", "Breakfast", "Lunch", "Dinner"])
     view_df = menu if slot_filter == "All" else menu[menu["Meal_Slot"] == slot_filter]
     st.dataframe(
@@ -690,34 +765,41 @@ with tab1:
     )
 
 with tab2:
-    st.subheader("🗣️ Natural-Language Craving & Constraint Extractor")
-    preset_prompts = {
-        "Custom Input (Type your own below)": "budget $40, time available 1600-1900, food allergy egg",
-        "Scenario A — Short Break Between Lectures + Spicy Noodles (HK$95)": "I have HK$95 today. Only 15 mins between lectures at noon so lunch must be fast, and I am craving spicy noodles for dinner. No beef please.",
-        "Scenario B — Egg Allergy + Tight Daily Budget (HK$40)": "budget $40, time available 1600-1900, food allergy egg",
-        "Scenario C — Banned Pork & Fried Food + High Protein (HK$115)": "Budget HK$115 for a healthy gym diet day. I want chicken or fish with rice, banned pork and avoid fried food.",
-        "Scenario D — Seafood Allergy + Curry & Sandwich Craving (HK$135)": "I have $135 today and want a delicious curry or truffle dish and a sandwich for breakfast. Allergic to seafood and shrimp."
-    }
-    chosen_preset = st.selectbox("Select a Sample Scenario or Enter Custom Text:", list(preset_prompts.keys()))
-    user_prompt = st.text_input(
-        "Describe your daily budget, available time window, allergies/restrictions, or cravings:",
-        value=preset_prompts[chosen_preset]
-    )
+    st.subheader("🗣️ Natural-Language Craving, Restaurant & Constraint Extractor")
+    in_col1, in_col2 = st.columns([1.4, 1])
+    with in_col1:
+        preset_prompts = {
+            "Custom Input (Type your own below)": "I have HK$95 today, craving spicy noodles for dinner, no beef please.",
+            "Scenario A — TamJai Spicy Noodles + No Beef (HK$95)": "I have HK$95 today, craving TamJai SamGor spicy noodles, no beef please.",
+            "Scenario B — Egg Allergy + Tight Budget (HK$85)": "budget $85, food allergy egg, want rice or noodles",
+            "Scenario C — Banned Pork & Fried Food + Gym Protein (HK$115)": "Budget HK$115 for a healthy gym diet day. I want chicken or fish with rice, banned pork and avoid fried food.",
+            "Scenario D — Seafood Allergy + Curry & Sandwich Craving (HK$135)": "I have $135 today and want a delicious curry or truffle dish and a sandwich for breakfast. Allergic to seafood and shrimp."
+        }
+        chosen_preset = st.selectbox("Select a Sample Scenario or Enter Custom Text:", list(preset_prompts.keys()))
+        user_prompt = st.text_input(
+            "Describe your daily budget, allergies/restrictions, or food cravings:",
+            value=preset_prompts[chosen_preset]
+        )
+    with in_col2:
+        ui_restaurants = st.multiselect(
+            "Craving for Restaurant(s) (Optional — Leave empty for All):",
+            options=all_outlets,
+            default=[]
+        )
 
     if llm_api_key.strip():
-        parsed = parse_craving_prompt_llm(user_prompt, w_base, default_budget, llm_api_key, llm_api_url, llm_model)
+        parsed = parse_craving_prompt_llm(user_prompt, w_base, default_budget, llm_api_key, llm_api_url, llm_model, ui_restaurants, all_outlets)
     else:
-        parsed = parse_craving_prompt_offline(user_prompt, w_base, default_budget)
+        parsed = parse_craving_prompt_offline(user_prompt, w_base, default_budget, ui_restaurants, all_outlets)
 
     p_col1, p_col2 = st.columns([1.2, 1])
     with p_col1:
         st.markdown("##### 🔍 Extracted Dining Constraints")
         st.caption(f"**Parser Mode:** `{parsed['parser_mode']}`")
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Target Budget", f"HK${parsed['budget_hkd']}")
-        m2.metric("Time Window", parsed.get("time_window", "Flexible"))
-        m3.metric("Min Lunch Conv.", f"{parsed['lunch_min_conv_score']:.2f}")
-        m4.metric("Excluded Items", ", ".join(parsed["exclude_keywords"]) if parsed["exclude_keywords"] else "None")
+        m2.metric("Restaurant Craving", ", ".join(parsed["preferred_restaurants"]) if parsed["preferred_restaurants"] else "All Outlets")
+        m3.metric("Excluded Items", ", ".join(parsed["exclude_keywords"]) if parsed["exclude_keywords"] else "None")
         st.write(
             "**Positive Craving Keywords:**",
             ", ".join(f"`{k}`" for k in parsed["craving_keywords"]) if parsed["craving_keywords"] else "`None`"
@@ -735,7 +817,8 @@ with tab2:
     st.subheader("🧬 Optimized 3-Meal Daily Plan (Genetic Algorithm: 50 Population × 40 Generations)")
     b_pool, l_pool, d_pool = filter_pools(menu, parsed)
     best_combo, best_fit, base_u, total_cost, history = run_genetic_algorithm(
-        b_pool, l_pool, d_pool, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], True
+        b_pool, l_pool, d_pool, parsed["w_final"], parsed["budget_hkd"],
+        parsed["craving_keywords"], parsed["preferred_restaurants"], True
     )
 
     m_cols = st.columns(3)
@@ -779,14 +862,14 @@ with tab3:
     st.caption("Comparing our full optimization pipeline against greedy cheapest-first selection, random valid selection, and equal-weight ablation.")
     b_p, l_p, d_p = filter_pools(menu, parsed)
     cheap_combo = [b_p.sort_values("Price_HKD").iloc[0], l_p.sort_values("Price_HKD").iloc[0], d_p.sort_values("Price_HKD").iloc[0]]
-    _, cheap_u, cheap_cost = combo_fitness(cheap_combo, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], False)
+    _, cheap_u, cheap_cost = combo_fitness(cheap_combo, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], parsed["preferred_restaurants"], False)
 
     rng = random.Random(7)
     rand_c = [b_p.iloc[rng.randrange(len(b_p))], l_p.iloc[rng.randrange(len(l_p))], d_p.iloc[rng.randrange(len(d_p))]]
-    _, rand_u, rand_cost = combo_fitness(rand_c, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], False)
+    _, rand_u, rand_cost = combo_fitness(rand_c, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], parsed["preferred_restaurants"], False)
 
-    abl_combo, _, _, abl_cost, _ = run_genetic_algorithm(b_p, l_p, d_p, [0.25, 0.25, 0.25, 0.25], parsed["budget_hkd"], [], False)
-    _, abl_true_u, _ = combo_fitness(abl_combo, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], False)
+    abl_combo, _, _, abl_cost, _ = run_genetic_algorithm(b_p, l_p, d_p, [0.25, 0.25, 0.25, 0.25], parsed["budget_hkd"], [], None, False)
+    _, abl_true_u, _ = combo_fitness(abl_combo, parsed["w_final"], parsed["budget_hkd"], parsed["craving_keywords"], parsed["preferred_restaurants"], False)
 
     comp_df = pd.DataFrame([
         {"Method": "1. Cheapest-First Greedy", "Breakfast": cheap_combo[0]["Dish Name"], "Lunch": cheap_combo[1]["Dish Name"], "Dinner": cheap_combo[2]["Dish Name"], "Total Cost (HK$)": round(cheap_cost, 1), "Utility Satisfaction (0-3.0)": round(cheap_u, 3)},
@@ -807,7 +890,7 @@ with tab3:
     for p_name, p_w in profiles.items():
         vals = []
         for b_val in sweep_budgets:
-            _, fit_v, u_v, c_v, _ = run_genetic_algorithm(b_all, l_all, d_all, p_w, b_val, [], False, pop_size=35, generations=25)
+            _, fit_v, u_v, c_v, _ = run_genetic_algorithm(b_all, l_all, d_all, p_w, b_val, [], None, False, pop_size=35, generations=25)
             vals.append(u_v if c_v <= b_val else max(0.8, u_v - 0.5))
         sweep_rows[p_name] = vals
     sweep_df = pd.DataFrame(sweep_rows, index=sweep_budgets)
