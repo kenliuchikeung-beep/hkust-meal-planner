@@ -694,7 +694,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🍽️ EatSmart @ HKUST — Budget-Aware AI Campus Meal Planner")
+st.title(" EatSmart HKUST , Personalised AI Campus Meal Planner")
 st.caption("Personalized full-day meal optimization combining student survey clustering, natural-language constraint extraction, and genetic algorithm search (Main Meals Only).")
 
 clean_s, profiles, menu = load_and_integrate_data()
