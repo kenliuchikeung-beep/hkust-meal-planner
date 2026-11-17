@@ -806,7 +806,7 @@ with tab2:
         )
         st.dataframe(w_comp_df, use_container_width=True)
 
-    st.subheader("🧬 Optimized 3-Meal Daily Plan (Genetic Algorithm: 50 Population × 40 Generations)")
+    st.subheader(" Optimized 3-Meal Daily Plan (Genetic Algorithm: 50 Population × 40 Generations)")
     b_pool, l_pool, d_pool = filter_pools(menu, parsed)
     best_combo, best_fit, base_u, total_cost, history = run_genetic_algorithm(
         b_pool, l_pool, d_pool, parsed["w_final"], parsed["budget_hkd"],
